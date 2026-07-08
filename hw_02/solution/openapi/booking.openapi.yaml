@@ -1,0 +1,309 @@
+openapi: 3.0.3
+info:
+  title: Booking Service API
+  description: Жизненный цикл travel-заказа. Оркестрация Saga hold → оплата → подтверждение.
+  version: 1.0.0
+
+servers:
+  - url: https://booking.travel.internal/v1
+
+tags:
+  - name: bookings
+
+paths:
+  /bookings:
+    post:
+      tags: [bookings]
+      operationId: createBooking
+      summary: Создание брони (после hold)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+      responses:
+        '201':
+          description: Бронь создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '409':
+          description: Hold истёк или недоступен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags: [bookings]
+      operationId: listBookings
+      summary: Список броней пользователя
+      parameters:
+        - name: user_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/BookingStatus'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+      responses:
+        '200':
+          description: Список броней
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Booking'
+
+  /bookings/{bookingId}:
+    get:
+      tags: [bookings]
+      operationId: getBooking
+      summary: Детали брони
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Бронь найдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /bookings/{bookingId}/pay:
+    post:
+      tags: [bookings]
+      operationId: payBooking
+      summary: Инициация оплаты
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayBookingRequest'
+      responses:
+        '200':
+          description: Оплата принята / ожидает 3DS
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentInitResult'
+        '402':
+          description: Оплата отклонена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /bookings/{bookingId}/cancel:
+    post:
+      tags: [bookings]
+      operationId: cancelBooking
+      summary: Отмена брони
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Отмена принята
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '409':
+          description: Отмена невозможна (политика тарифа)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /bookings/{bookingId}/status:
+    get:
+      tags: [bookings]
+      operationId: subscribeBookingStatus
+      summary: SSE-поток статуса брони
+      description: text/event-stream — обновления processing → confirmed / rejected
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Поток событий SSE
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  event: status
+                  data: {"status":"confirmed"}
+
+components:
+  parameters:
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    BookingStatus:
+      type: string
+      enum: [pending_payment, processing, confirmed, cancelled, rejected, refunded]
+
+    Guest:
+      type: object
+      required: [first_name, last_name]
+      properties:
+        first_name:
+          type: string
+        last_name:
+          type: string
+        email:
+          type: string
+          format: email
+        phone:
+          type: string
+
+    CreateBookingRequest:
+      type: object
+      required: [hold_id, user_id, guests]
+      properties:
+        hold_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        guests:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Guest'
+        comment:
+          type: string
+
+    PayBookingRequest:
+      type: object
+      required: [payment_method]
+      properties:
+        payment_method:
+          type: string
+          enum: [card, installment, loyalty_points, mixed]
+        return_url:
+          type: string
+          format: uri
+          description: URL возврата после 3-D Secure
+
+    PaymentInitResult:
+      type: object
+      required: [payment_id, status]
+      properties:
+        payment_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [succeeded, pending_3ds, failed]
+        redirect_url:
+          type: string
+          format: uri
+
+    Booking:
+      type: object
+      required: [id, user_id, status, property_id, check_in, check_out, total_price, currency]
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        hold_id:
+          type: string
+          format: uuid
+        property_id:
+          type: string
+          format: uuid
+        rate_plan_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+        check_in:
+          type: string
+          format: date
+        check_out:
+          type: string
+          format: date
+        guests:
+          type: array
+          items:
+            $ref: '#/components/schemas/Guest'
+        total_price:
+          type: number
+        currency:
+          type: string
+        payment_id:
+          type: string
+          format: uuid
+        supplier_confirmation_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+
+  responses:
+    NotFound:
+      description: Бронь не найдена
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
