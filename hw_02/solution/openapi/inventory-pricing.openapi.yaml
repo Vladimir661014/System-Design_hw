@@ -1,0 +1,286 @@
+openapi: 3.0.3
+info:
+  title: Inventory & Pricing Service API
+  description: Доступность, цены, промокоды и временные блокировки (hold).
+  version: 1.0.0
+
+servers:
+  - url: https://inventory.travel.internal/v1
+
+tags:
+  - name: availability
+  - name: holds
+  - name: pricing
+
+paths:
+  /availability/check:
+    post:
+      tags: [availability]
+      operationId: checkAvailability
+      summary: Проверка доступности и остатков
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AvailabilityRequest'
+      responses:
+        '200':
+          description: Результат проверки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilityResponse'
+
+  /pricing/quote:
+    post:
+      tags: [pricing]
+      operationId: getPriceQuote
+      summary: Расчёт итоговой цены с учётом скидок и баллов
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PriceQuoteRequest'
+      responses:
+        '200':
+          description: Расчёт цены
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PriceQuote'
+
+  /holds:
+    post:
+      tags: [holds]
+      operationId: createHold
+      summary: Временная блокировка (10–15 мин)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateHoldRequest'
+      responses:
+        '201':
+          description: Hold создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+        '409':
+          description: Нет доступных мест
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /holds/{holdId}:
+    get:
+      tags: [holds]
+      operationId: getHold
+      summary: Статус блокировки
+      parameters:
+        - $ref: '#/components/parameters/HoldId'
+      responses:
+        '200':
+          description: Hold найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [holds]
+      operationId: releaseHold
+      summary: Снятие блокировки (компенсация Saga)
+      parameters:
+        - $ref: '#/components/parameters/HoldId'
+      responses:
+        '204':
+          description: Hold снят
+
+  /holds/{holdId}/confirm:
+    post:
+      tags: [holds]
+      operationId: confirmHold
+      summary: Подтверждение блокировки после успешной оплаты
+      parameters:
+        - $ref: '#/components/parameters/HoldId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [booking_id]
+              properties:
+                booking_id:
+                  type: string
+                  format: uuid
+      responses:
+        '200':
+          description: Hold подтверждён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+
+components:
+  parameters:
+    HoldId:
+      name: holdId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    AvailabilityRequest:
+      type: object
+      required: [property_id, rate_plan_id, check_in, check_out, guests]
+      properties:
+        property_id:
+          type: string
+          format: uuid
+        rate_plan_id:
+          type: string
+          format: uuid
+        check_in:
+          type: string
+          format: date
+        check_out:
+          type: string
+          format: date
+        guests:
+          type: integer
+          minimum: 1
+
+    AvailabilityResponse:
+      type: object
+      required: [available, quantity]
+      properties:
+        available:
+          type: boolean
+        quantity:
+          type: integer
+        rate_plan_id:
+          type: string
+          format: uuid
+
+    PriceQuoteRequest:
+      type: object
+      required: [property_id, rate_plan_id, check_in, check_out, guests]
+      properties:
+        property_id:
+          type: string
+          format: uuid
+        rate_plan_id:
+          type: string
+          format: uuid
+        check_in:
+          type: string
+          format: date
+        check_out:
+          type: string
+          format: date
+        guests:
+          type: integer
+        promo_code:
+          type: string
+        loyalty_points:
+          type: integer
+          description: Баллы маркетплейса для списания
+        user_id:
+          type: string
+          format: uuid
+
+    PriceQuote:
+      type: object
+      required: [base_price, total_price, currency]
+      properties:
+        base_price:
+          type: number
+        discount:
+          type: number
+        loyalty_discount:
+          type: number
+        total_price:
+          type: number
+        currency:
+          type: string
+          example: RUB
+        installment_available:
+          type: boolean
+
+    CreateHoldRequest:
+      type: object
+      required: [property_id, rate_plan_id, check_in, check_out, guests, user_id]
+      properties:
+        property_id:
+          type: string
+          format: uuid
+        rate_plan_id:
+          type: string
+          format: uuid
+        check_in:
+          type: string
+          format: date
+        check_out:
+          type: string
+          format: date
+        guests:
+          type: integer
+        user_id:
+          type: string
+          format: uuid
+        idempotency_key:
+          type: string
+
+    Hold:
+      type: object
+      required: [id, status, expires_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        property_id:
+          type: string
+          format: uuid
+        rate_plan_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [active, confirmed, released, expired]
+        total_price:
+          type: number
+        currency:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        booking_id:
+          type: string
+          format: uuid
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+
+  responses:
+    NotFound:
+      description: Hold не найден
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

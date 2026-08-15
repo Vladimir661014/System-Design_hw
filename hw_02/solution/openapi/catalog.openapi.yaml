@@ -1,0 +1,198 @@
+openapi: 3.0.3
+info:
+  title: Catalog Service API
+  description: Статические и полустатические данные об отелях, рейсах и турах.
+  version: 1.0.0
+
+servers:
+  - url: https://catalog.travel.internal/v1
+
+tags:
+  - name: properties
+
+paths:
+  /properties:
+    get:
+      tags: [properties]
+      operationId: listProperties
+      summary: Пакетное получение объектов по ID
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          schema:
+            type: array
+            items:
+              type: string
+              format: uuid
+          style: form
+          explode: false
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [hotel, flight, tour]
+      responses:
+        '200':
+          description: Список объектов
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Property'
+
+  /properties/{propertyId}:
+    get:
+      tags: [properties]
+      operationId: getProperty
+      summary: Карточка объекта
+      parameters:
+        - $ref: '#/components/parameters/PropertyId'
+      responses:
+        '200':
+          description: Объект найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Property'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [properties]
+      operationId: upsertProperty
+      summary: Создание или обновление объекта (синхронизация от поставщика)
+      parameters:
+        - $ref: '#/components/parameters/PropertyId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PropertyUpsert'
+      responses:
+        '200':
+          description: Объект обновлён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Property'
+        '201':
+          description: Объект создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Property'
+
+components:
+  parameters:
+    PropertyId:
+      name: propertyId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    Property:
+      type: object
+      required: [id, type, name, location]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [hotel, flight, tour]
+        name:
+          type: string
+        description:
+          type: string
+        location:
+          $ref: '#/components/schemas/Location'
+        photos:
+          type: array
+          items:
+            type: string
+            format: uri
+        amenities:
+          type: array
+          items:
+            type: string
+        rating:
+          type: number
+          format: float
+        review_count:
+          type: integer
+        cancellation_policy:
+          type: string
+        supplier_id:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+
+    PropertyUpsert:
+      type: object
+      required: [type, name, location, supplier_id]
+      properties:
+        type:
+          type: string
+          enum: [hotel, flight, tour]
+        name:
+          type: string
+        description:
+          type: string
+        location:
+          $ref: '#/components/schemas/Location'
+        photos:
+          type: array
+          items:
+            type: string
+            format: uri
+        amenities:
+          type: array
+          items:
+            type: string
+        cancellation_policy:
+          type: string
+        supplier_id:
+          type: string
+
+    Location:
+      type: object
+      properties:
+        city:
+          type: string
+        country:
+          type: string
+        address:
+          type: string
+        latitude:
+          type: number
+          format: double
+        longitude:
+          type: number
+          format: double
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+
+  responses:
+    NotFound:
+      description: Объект не найден
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
