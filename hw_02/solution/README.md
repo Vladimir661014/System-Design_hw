@@ -52,11 +52,13 @@
 
 | Откуда → Куда | Протокол | Сценарий |
 |---|---|---|
-| Клиент → API Gateway (BFF) | **REST** | Поиск (`GET /search`), карточка предложения (`GET /offers/{id}`) — BFF агрегирует Catalog + Inventory |
-| Клиент → API Gateway (BFF) | **REST** | Оформление брони, оплата, отмена — идемпотентные команды, простой контракт |
+| Клиент → API Gateway (BFF) | **REST** | Поиск и карточка (`GET /search`, `GET /offers/{id}`) — BFF только в Search; Catalog/Inventory читает Search |
+| Клиент → API Gateway (BFF) | **REST** | Оформление: `POST /holds` → `POST /bookings` → `POST /bookings/{id}/pay`, отмена — идемпотентные команды |
 | Клиент ← API Gateway | **SSE** | Ожидание подтверждения брони у поставщика (статус «обрабатывается» → «подтверждено») |
-| Search & Offer → Catalog, Inventory | **gRPC** | Параллельное чтение метаданных и цен; latency-бюджет поиска — сотни миллисекунд |
-| Booking → Inventory & Pricing | **gRPC** | Hold / confirm / release — синхронно, строгий контракт, консистентность |
+| Search & Offer → Catalog, Inventory | **gRPC** | Единственная точка агрегации выдачи: метаданные + цены; latency-бюджет — сотни миллисекунд |
+| API Gateway → Catalog | **gRPC / REST** | Прямое чтение карточки объекта (`GET /properties/{id}`) — без поисковой выдачи, не дублирует Search |
+| API Gateway → Inventory & Pricing | **REST / gRPC** | Создание hold при оформлении (`POST /holds`) |
+| Booking → Inventory & Pricing | **gRPC** | Проверка hold при создании брони; confirm / release — на Saga оплаты |
 | Booking → Payment | **gRPC** | Списание и возврат в рамках Saga; идемпотентные вызовы по `idempotency_key` |
 | Booking → Supplier Integration | **gRPC** | Команды «подтвердить» / «отменить» у поставщика |
 | Supplier Integration → внешние партнёры | **REST** | Разнородные HTTP API отелей, GDS, туроператоров; webhook'и от партнёров |
@@ -69,24 +71,29 @@
 
 **Где:** клиент (web / mobile) → API Gateway (BFF) → Search & Offer, Catalog, Inventory, Booking, Payment.
 
-**Почему:** единый HTTP-контракт для чтения и записи. BFF агрегирует данные из внутренних сервисов и отдаёт клиенту готовые DTO:
-- `GET /search` — поиск с фильтрами; BFF параллельно запрашивает Search, Catalog, Inventory и собирает ответ;
-- `GET /offers/{id}` — карточка отеля/тура с ценой и доступностью;
-- `POST /bookings`, `POST /bookings/{id}/pay`, `POST /bookings/{id}/cancel` — команды жизненного цикла заказа.
+**Почему:** единый HTTP-контракт для чтения и записи. BFF не дублирует агрегацию Search:
+
+- `GET /search`, `GET /offers/{id}` — **только Search**; внутри Search сам ходит в Catalog + Inventory (gRPC) и ранжирует. BFF не вызывает Catalog/Inventory на этих запросах.
+- `GET /properties/{id}` (или аналог на BFF) — **напрямую в Catalog**, когда нужна статика объекта без поисковой выдачи (deep link, страница отеля вне оффера).
+- `POST /holds` — Inventory (блокировка до брони);
+- `POST /bookings` — создание брони **по уже существующему** `hold_id` → `pending_payment`;
+- `POST /bookings/{id}/pay`, `POST /bookings/{id}/cancel` — оплата и отмена.
+
+Итого Catalog читается с двух путей, но **в разных сценариях**, не дважды на одном запросе: через Search (выдача/оффер) или напрямую (карточка property).
 
 REST нативно поддерживается браузером и мобильными SDK, легко кэшируется на CDN для статики каталога, проще версионировать (`/v1/...`) и отлаживать (curl, OpenAPI). Идемпотентные команды удобны для retry на клиенте. Webhook'и от платёжного провайдера — тоже REST (`POST /payments/callback`).
 
-**Trade-off:** при поиске BFF может сделать несколько внутренних вызовов вместо одного GraphQL-запроса — компенсируем параллельными gRPC-вызовами к Catalog и Inventory; overfetching на клиенте не критичен, т.к. BFF отдаёт уже собранный ответ.
+**Trade-off:** на поиске один внутренний hop BFF → Search (Search параллелит Catalog и Inventory); прямые вызовы BFF → Catalog/Inventory оставляем только для сценариев вне Search.
 
 ### gRPC — синхронное межсервисное взаимодействие
 
 **Где:** Search → Catalog / Inventory; Booking → Inventory / Payment / Supplier Integration.
 
 **Почему:**
-- **Search → Catalog / Inventory** — при выдаче результатов BFF/Search делает десятки параллельных чтений; Protobuf компактнее JSON, HTTP/2 мультиплексирует запросы, `.proto` даёт строгую типизацию между командами на разных языках.
-- **Booking → Inventory** — hold должен ответить за < 100 ms, иначе пользователь уходит; нужна атомарная семантика «заблокировать или отказать».
-- **Booking → Payment** — Saga-оркестрация: синхронный вызов «списать» с немедленным ответом success/fail; при fail — компенсирующий release hold.
-- **Booking → Supplier Integration** — команда подтверждения с таймаутом; gRPC deadline передаётся по цепочке.
+- **Search → Catalog / Inventory** — Search — единственный агрегатор выдачи; BFF на `GET /search` / `GET /offers/{id}` не ходит в Catalog повторно. Protobuf + HTTP/2 для десятков параллельных чтений внутри Search.
+- **Booking → Inventory** — при создании брони проверка/привязка `hold_id`; на Saga оплаты — `confirm` / `release` hold (< 100 ms, атомарно).
+- **Booking → Payment** — на `POST .../pay`: синхронный вызов «списать» с немедленным ответом success/fail; при fail — компенсирующий release hold.
+- **Booking → Supplier Integration** — после успешной оплаты: команда подтверждения с таймаутом; gRPC deadline передаётся по цепочке.
 
 **Почему не REST внутри:** выше latency, слабее контракт; gRPC не подходит для браузера — поэтому только backend-to-backend.
 
@@ -125,13 +132,15 @@ REST нативно поддерживается браузером и моби�
 
 ### 1. Основной поток бронирования [1_Cхема_взаимодействия_(основной поток бронирования).png](diagrams/1_Cхема_взаимодействия_(основной%20поток%20бронирования).png)
 
-Сквозная sequence-диаграмма happy path и веток ошибок на критическом пути:
+Публичный контракт (OpenAPI) — **три шага**, а не один `POST /bookings`:
 
-1. **Критический путь (синхронно, gRPC):** клиент → BFF (`REST POST /bookings`) → Booking → Inventory (`hold`) → Payment (`charge`) → Supplier Integration (`confirm` у поставщика по REST).
-2. **Ветвления:** hold не удался → `409`; оплата не прошла → `release hold` + `402`; оплата прошла → `202 Accepted` + SSE-подписка на статус.
-3. **Асинхронные потоки (Kafka):** обновления инвентаря от Supplier Integration, события `BookingConfirmed` / `PaymentSucceeded` / `RefundCompleted`, доставка уведомлений через Notification (retries + DLQ — сбой доставки не откатывает бронь).
+1. **Hold:** клиент → BFF → Inventory (`POST /holds`) → `hold_id`, TTL 10–15 мин. Нет мест → `409`.
+2. **Создание брони:** `POST /bookings` с `hold_id` + гости → Booking проверяет hold → `201`, статус `pending_payment`. Оплаты и confirm у поставщика здесь нет.
+3. **Оплата и Saga:** `POST /bookings/{id}/pay` → Booking → Payment (`gRPC charge`, sync `success` / `fail`) → при fail: `release hold` + `402`; при success: `gRPC confirm` у Supplier Integration, клиенту `202` + SSE на статус.
 
-Показывает сочетание синхронных команд на пути пользователя и событийной развязки для всего, что не блокирует ответ клиенту.
+На PNG критический путь схлопнут в один кадр «hold → charge → confirm» — это шаги **1 и 3** оркестрации Inventory/Payment/Supplier; создание записи брони (шаг 2) между hold и pay, как в [booking.openapi.yaml](openapi/booking.openapi.yaml) (`summary: Создание брони (после hold)`).
+
+**Асинхронно после оплаты:** SSE-статус; Kafka — уведомления, события Payment (fan-out / refund), обновления инвентаря.
 
 ### 2. Синхронизация инвентаря от поставщиков [2_Схема_потока_синхронизации_инвентаря_(от поставщиков).png](diagrams/2_Схема_потока_синхронизации_инвентаря_(от%20поставщиков).png)
 
@@ -176,7 +185,7 @@ REST нативно поддерживается браузером и моби�
 |---|---|---|
 | Поиск и карточка предложения | **Синхронный** | Пользователь ждёт результат на экране; latency-бюджет < 1 с |
 | Hold номера при оформлении | **Синхронный** | Нужен немедленный ответ «заблокировано / нет мест» |
-| Списание оплаты | **Синхронный** | Без подтверждения оплаты нельзя переходить к подтверждению брони |
+| Списание оплаты | **Синхронный** | Как на схеме 1: Booking → Payment (`gRPC charge`) → сразу `success` / `fail`; без этого нельзя идти к confirm / ответу клиенту |
 | Подтверждение у поставщика | **Асинхронный** | Внешний API отеля/GDS отвечает 5–60 с; HTTP-запрос пользователя нельзя держать |
 | Обновление цен и остатков от поставщиков | **Асинхронный** | Поток тысяч событий; Inventory обрабатывает в своём темпе |
 | Push / email / SMS | **Асинхронный** | Доставка уведомления не блокирует бизнес-операцию |
@@ -225,12 +234,14 @@ Booking / Payment → Kafka: BookingConfirmed, BookingCancelled, RefundCompleted
 #### 4. Callback от платёжного провайдера [async-flow-04-payment-callback.png](diagrams/async/async-flow-04-payment-callback.png)
 
 ```
-Payment service → [REST webhook] → Payment → Kafka: PaymentSucceeded / PaymentFailed
+Payment service → [REST webhook] → Payment → Kafka: PaymentSucceeded / PaymentFailed / RefundCompleted
                                                     ↓
                                               Booking (consumer)
 ```
 
-**Почему async:** 3-D Secure и рассрочка завершаются вне нашего запроса — провайдер присылает webhook, когда операция завершена. Payment валидирует подпись, публикует событие; Booking продолжает Saga.
+**Списание на критическом пути — синхронное** (схема 1): Booking ждёт от Payment `success` / `fail` по gRPC и только после этого ветвит Saga (`confirm` или `release hold` + `402`).
+
+Webhook и события в Kafka **не заменяют** этот ответ. Они нужны для побочных и отложенных фактов от провайдера: подтверждение/корректировка после списания, `RefundCompleted` при отмене, сверка. Booking как consumer может запустить компенсацию, но happy-path оплаты остаётся request/response, как на схеме 1.
 
 #### 5. Отложенные напоминания [async-flow-05-check-in-reminder.png](diagrams/async/async-flow-05-check-in-reminder.png)
 
@@ -247,7 +258,7 @@ Booking → Kafka (scheduled topic, delay 24h): CheckInReminder
 | Участок | Причина |
 |---|---|
 | Hold / release в Inventory | Атомарность: два параллельных hold на последний номер должны сериализоваться |
-| Списание в Payment (первичный вызов) | Пользователь на экране оплаты — ждёт success/fail |
+| Списание в Payment (gRPC charge) | Как на схеме 1: пользователь ждёт `success` / `fail` в том же запросе |
 | Поиск и чтение каталога | Данные нужны для рендера UI прямо сейчас |
 
 ### Гарантии и компромиссы
@@ -273,12 +284,12 @@ Booking → Kafka (scheduled topic, delay 24h): CheckInReminder
 
 **Проблема:** бронирование затрагивает Inventory (hold), Payment (списание) и Supplier Integration (подтверждение). Классическая ACID-транзакция через три сервиса невозможна.
 
-**Решение:** Booking — оркестратор Saga. Последовательность:
+**Решение:** Booking — оркестратор Saga **на шаге оплаты** (hold уже создан ранее). Последовательность:
 
-1. `hold` в Inventory → при fail — конец, пользователю «нет мест»
-2. `charge` в Payment → при fail — компенсация: `release hold`
-3. `confirm` в Supplier Integration → при fail — компенсация: `refund` + `release hold`
-4. При успехе — `confirm hold` в Inventory, публикация `BookingConfirmed`
+0. (до Saga) Inventory: `POST /holds` → клиент оформляет бронь с `hold_id` → Booking: `POST /bookings` → `pending_payment`
+1. `POST /bookings/{id}/pay` → `charge` в Payment → при fail — компенсация: `release hold`, статус не уходит в confirm
+2. `confirm` в Supplier Integration → при fail — компенсация: `refund` + `release hold`
+3. При успехе — `confirm hold` в Inventory, публикация `BookingConfirmed`
 
 **Почему оркестрация, а не хореография:** сценарий линейный с ветвлением и компенсациями; один сервис (Booking) владеет состоянием Saga и проще отлаживается. Хореография через события усложнила бы отслеживание «на каком шаге застряла бронь».
 
@@ -308,7 +319,7 @@ Booking → Kafka (scheduled topic, delay 24h): CheckInReminder
 
 **Проблема:** клиенту не нужно знать про 7 внутренних сервисов и их протоколы.
 
-**Решение:** API Gateway (BFF) — единая точка входа REST. Агрегирует `GET /search` из Search + Catalog + Inventory, проксирует команды в Booking. Внутри — gRPC; снаружи — REST + SSE.
+**Решение:** API Gateway (BFF) — единая точка входа REST. `GET /search` и `GET /offers/{id}` проксирует в Search (агрегация Catalog + Inventory внутри Search); напрямую в Catalog — только карточка property вне поиска; команды оформления — в Inventory / Booking. Внутри — gRPC; снаружи — REST + SSE.
 
 ### Anti-Corruption Layer — Supplier Integration
 
