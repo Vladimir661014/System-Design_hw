@@ -1,0 +1,12 @@
+flowchart LR
+  U["Пользователи"] --> DNS["Route 53 / Global Load Balancer"]
+  DNS -->|"active"| A1["Регион A — active<br/>BFF + 7 сервисов, 100%"]
+  DNS -.->|"failover"| B1["Регион B — warm standby<br/>BFF + 7 сервисов, 20% → 100%"]
+  A1 --> A2["БД primary<br/>Scylla / PG / Mongo / OpenSearch / Kafka"]
+  B1 --> B2["БД standby<br/>promotion target"]
+  A2 -. "sync: Booking/Payment<br/>async: остальные<br/>RPO 0–15 мин" .-> B2
+  A1 -->|"detect + declare"| IC["Incident Commander / SRE"]
+  IC -->|"1. freeze writes + fence A"| A1
+  IC -->|"2. promote DB + scale B"| B1
+  B1 -->|"3. smoke + switch DNS"| DNS
+  DNS -->|"4. unfreeze + reconcile"| U
